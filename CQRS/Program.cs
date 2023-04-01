@@ -10,6 +10,9 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.Net.Http.Headers;
+using Polly;
+using Polly.CircuitBreaker;
+using Polly.Extensions.Http;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
@@ -38,8 +41,8 @@ builder.Services.Configure<IpRateLimitOptions>(options =>
             {
                 //Endpoint = "GET:/employee/getAllEmployees",
                 Endpoint = "*",
-                Period = "20s",
-                Limit = 2,
+                Period = "10s",
+                Limit = 300,
             }
         };
 });
@@ -62,7 +65,18 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJw
         ClockSkew = TimeSpan.Zero,
     };
 });
+builder.Services.AddHttpClient("LocalClient", httpClient =>
+{
+    httpClient.BaseAddress = new Uri("https://localhost:7071/");
+});
+builder.Services.AddHttpClient("PokemonClient", httpClient =>
+{
+    httpClient.BaseAddress = new Uri("https://pokeapi.co/");
+    //httpClient.DefaultRequestHeaders.Add(HeaderNames.Accept, "application/vnd.github.v3+json");
+});
 
+
+//BUILD APP
 var app = builder.Build();
 
 app.UseIpRateLimiting();
@@ -118,6 +132,31 @@ app.MapPost("/todo", async (IMediator mediator, Todo data) =>
     IRequest<CreateTodoResponse> command = new CreateTodoCommand(data.Name);
     CreateTodoResponse response = await mediator.Send(command);
     return response;
+});
+
+app.MapGet("/pokemon", async (IHttpClientFactory httpClientFactory, string pokemonName) =>
+{
+    var client = httpClientFactory.CreateClient("PokemonClient");
+    var pokemon = await client.GetAsync($"/api/v2/pokemon/{pokemonName}/");
+    return await pokemon.Content.ReadAsStringAsync();
+});
+
+//Si el 50% de 10 request fallan en un periodo de 10 segundos, activa el circuito por 15 segundos.
+AsyncCircuitBreakerPolicy<HttpResponseMessage> circuitBreaker = Policy<HttpResponseMessage>.Handle<HttpRequestException>()
+    .OrTransientHttpError()
+    .AdvancedCircuitBreakerAsync(0.6, TimeSpan.FromSeconds(10), 10, TimeSpan.FromSeconds(15));
+
+app.MapGet("/circuitBreaker", async (IHttpClientFactory httpClientFactory, bool f) =>
+{
+    var client = httpClientFactory.CreateClient("LocalClient");
+    //var response = await client.GetAsync($"/failApi?f={(f ? "true" : "false")}");
+    var response = await circuitBreaker.ExecuteAsync(() => client.GetAsync($"/failApi?f={(f ? "true" : "false")}"));
+    return await response.Content.ReadAsStringAsync();
+});
+
+app.MapGet("/failApi", (bool f) =>
+{
+    return !f ? ":)" : throw new Exception("Error");
 });
 
 app.Run();
